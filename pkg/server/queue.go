@@ -11,8 +11,9 @@ import (
 )
 
 const (
-	// MaxBatchSizeBytes represents maximum size of a batch in bytes (30MB)
-	MaxBatchSizeBytes = 30 * 1024 * 1024
+	// MaxBatchSizeBytes represents maximum size of a batch in bytes (1.88MB)
+	// Set slightly below Celestia's limit of 1,974,272 bytes
+	MaxBatchSizeBytes = 1_900_000
 	// DefaultBatchInterval represents the default time to wait before processing a batch
 	// Set to 5s to be closer to Celestia's 6s block time for better synchronization
 	DefaultBatchInterval = 5 * time.Second

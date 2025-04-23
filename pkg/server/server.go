@@ -52,7 +52,8 @@ func NewServer(cfg Config) (*Server, error) {
 	}
 
 	// Create the query queue
-	queryQueue := NewQueryQueue(celestiaManager, 2*time.Second)
+	// Use the default batch interval defined in queue.go (5s)
+	queryQueue := NewQueryQueue(celestiaManager, 0)
 
 	// Create the server instance
 	server := &Server{

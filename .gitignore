@@ -1,0 +1,36 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+onchain-sql-db
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Dependency directories (remove the comment below to include it)
+# vendor/
+
+# Compiled Object files, Static and Dynamic libs (Shared Objects)
+*.o
+*.a
+*.so
+
+# Go workspace file
+go.work
+
+# SQLite database files
+*.db
+*.db-journal
+
+# IDE directories
+.idea/
+.vscode/
+
+# System files
+.DS_Store
+Thumbs.db

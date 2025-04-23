@@ -56,13 +56,14 @@ type StatusResponse struct {
 
 // Transaction record for tracking insert operations
 type InsertRecord struct {
-	ID           int
-	Value        string
-	SubmitTime   time.Time
-	Height       uint64
-	Committed    bool
-	CommitTime   time.Time
-	CommitHeight uint64
+	ID                 int
+	Value              string
+	Height             uint64
+	SubmitTime         time.Time
+	Committed          bool
+	CommitTime         time.Time
+	CommitHeight       uint64
+	RepresentsBatchSize int
 }
 
 // Transaction metrics
@@ -264,10 +265,16 @@ func main() {
 		ticker := time.NewTicker(config.PollInterval)
 		defer ticker.Stop()
 
-		recordsToCheck := make([]*InsertRecord, 0, config.NumRecords)
-		for _, record := range records {
-			// In our system, height may be 0 but still valid, so include all records
-			recordsToCheck = append(recordsToCheck, record)
+		// Only check the last record from each batch instead of every record
+		recordsToCheck := make([]*InsertRecord, 0, len(batches))
+		for _, batch := range batches {
+			if len(batch.Records) > 0 {
+				// Get the last record from each batch
+				lastRecord := batch.Records[len(batch.Records)-1]
+				// Mark this record as representing the entire batch
+				lastRecord.RepresentsBatchSize = len(batch.Records)
+				recordsToCheck = append(recordsToCheck, lastRecord)
+			}
 		}
 
 		if len(recordsToCheck) == 0 {
@@ -318,15 +325,22 @@ func main() {
 								// Update metrics
 								latency := record.CommitTime.Sub(record.SubmitTime)
 								metrics.AddLatency(latency)
-								atomic.AddInt32(&newlyCommitted, 1)
-								newCompleted := atomic.AddInt32(&completedRecords, 1)
+								
+								// If this record represents a batch, count all records in the batch
+								recordsRepresented := 1
+								if record.RepresentsBatchSize > 0 {
+									recordsRepresented = record.RepresentsBatchSize
+								}
+								
+								atomic.AddInt32(&newlyCommitted, int32(recordsRepresented))
+								newCompleted := atomic.AddInt32(&completedRecords, int32(recordsRepresented))
 
 								if config.VerboseLogging {
 									log.Printf("Record %d committed (latency: %v)", record.ID, latency.Round(time.Millisecond))
 								}
 
 								// Check if we're done
-								if newCompleted == int32(len(recordsToCheck)) {
+								if newCompleted >= int32(config.NumRecords) {
 									// Signal completion, but don't close here
 									// as the channel is closed in the outer scope
 									select {
@@ -371,7 +385,7 @@ func main() {
 				}
 
 				// Check if all records are committed
-				if atomic.LoadInt32(&completedRecords) == int32(len(recordsToCheck)) {
+				if atomic.LoadInt32(&completedRecords) >= int32(config.NumRecords) {
 					// Signal completion, but don't close here
 					// as the channel might already be closed
 					select {
@@ -400,7 +414,12 @@ func main() {
 
 	// Update metrics
 	metrics.CommitEndTime = time.Now()
-	metrics.CommittedRecords = int(atomic.LoadInt32(&completedRecords))
+	committedRecords := int(atomic.LoadInt32(&completedRecords))
+	// In case we represent more records than we actually submitted (due to batch markers)
+	if committedRecords > config.NumRecords {
+		committedRecords = config.NumRecords
+	}
+	metrics.CommittedRecords = committedRecords
 
 	// Generate performance report
 	generateReport(metrics, config)

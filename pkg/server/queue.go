@@ -14,7 +14,8 @@ const (
 	// MaxBatchSizeBytes represents maximum size of a batch in bytes (30MB)
 	MaxBatchSizeBytes = 30 * 1024 * 1024
 	// DefaultBatchInterval represents the default time to wait before processing a batch
-	DefaultBatchInterval = 2 * time.Second
+	// Set to 5s to be closer to Celestia's 6s block time for better synchronization
+	DefaultBatchInterval = 5 * time.Second
 )
 
 // QueryQueueItem represents a single item in the query queue
@@ -41,6 +42,8 @@ type QueryQueue struct {
 	ctx             context.Context
 	cancel          context.CancelFunc
 	wg              sync.WaitGroup
+	processing      bool           // Flag to indicate if a batch is currently being processed
+	processCond     *sync.Cond     // Condition variable for coordinating batch processing
 }
 
 // NewQueryQueue creates a new query queue
@@ -50,13 +53,20 @@ func NewQueryQueue(celestiaManager *celestia.Manager, batchInterval time.Duratio
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	return &QueryQueue{
+	
+	q := &QueryQueue{
 		celestiaManager: celestiaManager,
 		queue:           make([]QueryQueueItem, 0),
 		batchInterval:   batchInterval,
 		ctx:             ctx,
 		cancel:          cancel,
+		processing:      false,
 	}
+	
+	// Initialize condition variable with queue mutex
+	q.processCond = sync.NewCond(&q.mutex)
+	
+	return q
 }
 
 // Start starts the query queue processor
@@ -71,32 +81,69 @@ func (q *QueryQueue) Stop() {
 	q.wg.Wait()
 }
 
+// AddQueries adds multiple queries to the queue
+func (q *QueryQueue) AddQueries(queries []string) []chan QueryResult {
+	q.mutex.Lock()
+	
+	// Wait for any current batch processing to complete
+	// This ensures that batches are processed and submitted in sequence
+	for q.processing {
+		log.Printf("Waiting for previous batch to complete before adding %d new queries", len(queries))
+		q.processCond.Wait()
+	}
+
+	// Create result channels
+	resultChans := make([]chan QueryResult, len(queries))
+
+	// Add all queries to the queue
+	for i, query := range queries {
+		resultChan := make(chan QueryResult, 1)
+		resultChans[i] = resultChan
+
+		q.queue = append(q.queue, QueryQueueItem{
+			Query:      query,
+			Size:       len(query),
+			AddedAt:    time.Now(),
+			ResultChan: resultChan,
+		})
+	}
+
+	// Log for monitoring purposes
+	log.Printf("Added %d queries to queue, current queue size: %d items", len(queries), len(q.queue))
+
+	q.mutex.Unlock()
+	return resultChans
+}
+
 // AddQuery adds a query to the queue with option to wait for result
 // If waitResult is true, it returns a channel that will receive the result
 // If waitResult is false, it returns nil (non-blocking mode)
 func (q *QueryQueue) AddQuery(query string) chan QueryResult {
 	q.mutex.Lock()
-	defer q.mutex.Unlock()
+	
+	// Wait for any current batch processing to complete
+	// This ensures that batches are processed and submitted in sequence
+	for q.processing {
+		log.Printf("Waiting for previous batch to complete before adding new query")
+		q.processCond.Wait()
+	}
 
-	// Create a buffered channel to avoid blocking the sender if no one is receiving
-	var resultChan chan QueryResult = nil
-	
-	// In non-blocking mode we still create a dummy channel for internal use
-	// but we don't return it to the caller
-	dummyChan := make(chan QueryResult, 1)
-	
-	// Add query to queue
+	// Create result channel
+	resultChan := make(chan QueryResult, 1)
+
+	// Add the query to the queue
 	q.queue = append(q.queue, QueryQueueItem{
 		Query:      query,
 		Size:       len(query),
 		AddedAt:    time.Now(),
-		ResultChan: dummyChan,
+		ResultChan: resultChan,
 	})
 
 	// Log for monitoring purposes
 	log.Printf("Added query to queue, current queue size: %d items", len(q.queue))
-	
-	return resultChan // Will be nil in non-blocking mode
+
+	q.mutex.Unlock()
+	return resultChan
 }
 
 // processQueue periodically processes the query queue
@@ -120,11 +167,15 @@ func (q *QueryQueue) processQueue() {
 func (q *QueryQueue) processBatch() {
 	q.mutex.Lock()
 	
-	// If queue is empty, nothing to do
-	if len(q.queue) == 0 {
+	// If queue is empty or already processing a batch, nothing to do
+	if len(q.queue) == 0 || q.processing {
 		q.mutex.Unlock()
 		return
 	}
+	
+	// Mark as processing to prevent concurrent batch processing
+	// This ensures ordered submission of batches
+	q.processing = true
 
 	// Create batches respecting the max size limit
 	var batches [][]QueryQueueItem
@@ -212,6 +263,12 @@ func (q *QueryQueue) submitBatch(batch []QueryQueueItem) {
 			close(item.ResultChan)
 		}
 	}
+	
+	// Lock to update processing state and signal waiting goroutines
+	q.mutex.Lock()
+	q.processing = false
+	q.processCond.Broadcast() // Signal that processing is complete
+	q.mutex.Unlock()
 }
 
 // quoteAndJoin quotes each string in the slice and joins them with the specified separator

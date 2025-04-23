@@ -46,6 +46,19 @@ type QueryResponse struct {
 	Message string      `json:"message,omitempty"`
 }
 
+// BatchRequest represents a batch of SQL queries to be executed
+type BatchRequest struct {
+	Queries []string `json:"queries"`
+}
+
+// BatchResponse represents a response from the batch endpoint
+type BatchResponse struct {
+	Success bool   `json:"success"`
+	Count   int    `json:"count,omitempty"`
+	Message string `json:"message,omitempty"`
+	Error   string `json:"error,omitempty"`
+}
+
 // ServerStatus represents the status response of the server
 type StatusResponse struct {
 	Status             string `json:"status"`
@@ -486,7 +499,7 @@ func createTestTable(serverURL, tableName string) error {
 	return nil
 }
 
-// Submit a batch of inserts, with each record as its own INSERT statement
+// Submit a batch of inserts using the /batch endpoint
 func submitBatch(ctx context.Context, serverURL string, batch *InsertBatch, tableName string) error {
 	submitTime := time.Now()
 	client := &http.Client{}
@@ -502,71 +515,82 @@ func submitBatch(ctx context.Context, serverURL string, batch *InsertBatch, tabl
 		currentHeight = status.CurrentHeight
 	}
 	
-	// Submit each record as its own INSERT statement
+	// Create a batch request with all insert statements
+	queries := make([]string, 0, len(batch.Records))
+	
 	for _, record := range batch.Records {
-		// Create individual INSERT for this record
+		// Create INSERT statement for this record
 		insertSQL := fmt.Sprintf("INSERT INTO %s (id, value) VALUES (%d, '%s')",
 			tableName, record.ID, record.Value)
 		
-		// Print the SQL for debug purposes
-		fmt.Printf("DEBUG: Executing individual SQL: %s\n", insertSQL)
+		// Add to queries list
+		queries = append(queries, insertSQL)
 		
-		// Send request to insert this record
-		queryReq := QueryRequest{Query: insertSQL}
-		reqBody, err := json.Marshal(queryReq)
-		if err != nil {
-			return fmt.Errorf("failed to marshal insert request: %w", err)
-		}
-		
-		req, err := http.NewRequestWithContext(ctx, http.MethodPut, serverURL+"/query", bytes.NewBuffer(reqBody))
-		if err != nil {
-			return fmt.Errorf("failed to create HTTP request: %w", err)
-		}
-		req.Header.Set("Content-Type", "application/json")
-		
-		// Set submission time
+		// Set submission time for all records
 		record.SubmitTime = submitTime
-		
-		// Send the request
-		resp, err := client.Do(req)
-		if err != nil {
-			return fmt.Errorf("failed to send insert request: %w", err)
-		}
-		
-		// Check response
-		if resp.StatusCode != http.StatusOK {
-			respBody, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			return fmt.Errorf("server returned non-OK status: %s, body: %s", resp.Status, string(respBody))
-		}
-		
-		// Parse response
-		var response QueryResponse
-		if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
-			resp.Body.Close()
-			return fmt.Errorf("failed to decode insert response: %w", err)
-		}
+	}
+	
+	// Print batch summary
+	fmt.Printf("INFO: Submitting batch with %d SQL statements\n", len(queries))
+	
+	// Send all queries in a single batch request
+	batchReq := BatchRequest{Queries: queries}
+	reqBody, err := json.Marshal(batchReq)
+	if err != nil {
+		return fmt.Errorf("failed to marshal batch request: %w", err)
+	}
+	
+	// Create HTTP request to /batch endpoint
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, serverURL+"/batch", bytes.NewBuffer(reqBody))
+	if err != nil {
+		return fmt.Errorf("failed to create batch HTTP request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	
+	// Send the batch request
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to send batch request: %w", err)
+	}
+	
+	// Check response
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		
-		if !response.Success {
-			return fmt.Errorf("insert failed: %s", response.Error)
-		}
-		
-		// Print response details
-		fmt.Printf("DEBUG: Record %d response: success=%v, height=%d, message=%s\n", 
-			record.ID, response.Success, response.Height, response.Message)
-		
-		// Update height if available from response
-		if response.Height > 0 && response.Height > currentHeight {
-			currentHeight = response.Height
-		}
-		
-		// Assign current tracking height to the record
+		return fmt.Errorf("server returned non-OK status for batch request: %s, body: %s", 
+			resp.Status, string(respBody))
+	}
+	
+	// Parse response
+	var batchResponse BatchResponse
+	if err := json.NewDecoder(resp.Body).Decode(&batchResponse); err != nil {
+		resp.Body.Close()
+		return fmt.Errorf("failed to decode batch response: %w", err)
+	}
+	resp.Body.Close()
+	
+	if !batchResponse.Success {
+		return fmt.Errorf("batch submission failed: %s", batchResponse.Error)
+	}
+	
+	// Print response details
+	fmt.Printf("INFO: Batch response: success=%v, count=%d, message=%s\n", 
+		batchResponse.Success, batchResponse.Count, batchResponse.Message)
+	
+	// Check server status again to get the height after batch submission
+	newStatus, err := getServerStatus(serverURL)
+	if err == nil && newStatus != nil && newStatus.CurrentHeight > currentHeight {
+		currentHeight = newStatus.CurrentHeight
+	}
+	
+	// Assign current tracking height to all records in the batch
+	for _, record := range batch.Records {
 		record.Height = currentHeight
 	}
 	
 	// Log the height assignment for the batch
-	fmt.Printf("DEBUG: Assigned height %d to batch records\n", currentHeight)
+	fmt.Printf("DEBUG: Assigned height %d to all %d records in batch\n", 
+		currentHeight, len(batch.Records))
 	
 	return nil
 }

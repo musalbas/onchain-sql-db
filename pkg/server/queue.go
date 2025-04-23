@@ -15,8 +15,8 @@ const (
 	// Set slightly below Celestia's limit of 1,974,272 bytes
 	MaxBatchSizeBytes = 1_900_000
 	// DefaultBatchInterval represents the default time to wait before processing a batch
-	// Set to 5s to be closer to Celestia's 6s block time for better synchronization
-	DefaultBatchInterval = 5 * time.Second
+	// Set to 3s for more frequent batch processing while still being reasonable for Celestia
+	DefaultBatchInterval = 3 * time.Second
 )
 
 // QueryQueueItem represents a single item in the query queue
@@ -48,6 +48,7 @@ type QueryQueue struct {
 	processing      bool           // Flag to indicate if a batch is currently being submitted
 	processCond     *sync.Cond     // Condition variable for coordinating batch processing
 	lastLogTime     time.Time      // Tracks when we last logged queue stats to limit frequency
+	creatingBatch   bool           // Flag to indicate if we're currently creating a sized batch
 }
 
 // NewQueryQueue creates a new query queue
@@ -67,6 +68,7 @@ func NewQueryQueue(celestiaManager *celestia.Manager, batchInterval time.Duratio
 		cancel:          cancel,
 		processing:      false,
 		lastLogTime:     time.Now(),
+		creatingBatch:   false,
 	}
 	
 	// Initialize condition variable with queue mutex
@@ -125,21 +127,27 @@ func (q *QueryQueue) AddQueries(queries []string) []chan QueryResult {
 	totalQueueSize += newQueriesSize
 	
 	// Log queue size at most once per second
-	triggerBatchNow := false
 	if time.Since(q.lastLogTime) > time.Second {
 		log.Printf("QUEUE STATUS: %d items, %.2f KB total (%.1f%% of max batch size)", 
 			len(q.queue), float64(totalQueueSize)/1024, (float64(totalQueueSize)/float64(MaxBatchSizeBytes))*100)
 		q.lastLogTime = time.Now()
 	}
 	
-	// If queue exceeds max batch size, trigger batch creation immediately and reset timer
-	if totalQueueSize >= MaxBatchSizeBytes {
+	// Only trigger a batch if we're not already creating one
+	triggerBatchNow := false
+	
+	// If queue exceeds max batch size and no batch is being created currently
+	if totalQueueSize >= MaxBatchSizeBytes && !q.creatingBatch {
 		log.Printf("QUEUE FULL: Total size %.2f KB exceeds max batch size - triggering immediate batch creation", 
 			float64(totalQueueSize)/1024)
+		
 		triggerBatchNow = true
 		
 		// Reset the batch interval timer
 		q.resetBatchTimer()
+		
+		// Set the flag to prevent multiple concurrent batch creations
+		q.creatingBatch = true
 	}
 	
 	// Signal that something has been added to the queue
@@ -148,9 +156,9 @@ func (q *QueryQueue) AddQueries(queries []string) []chan QueryResult {
 	// Unlock before triggering batch to avoid deadlock
 	q.mutex.Unlock()
 	
-	// If the queue is full, trigger batch creation immediately, but only for the full portion
+	// If the queue is full and we're not already creating a batch, trigger batch creation immediately
 	if triggerBatchNow {
-		go q.createSizedBatch(MaxBatchSizeBytes)
+		q.createSizedBatch(MaxBatchSizeBytes)
 	}
 	
 	return resultChans
@@ -163,13 +171,13 @@ func (q *QueryQueue) AddQuery(query string) chan QueryResult {
 	// Create result channel
 	resultChan := make(chan QueryResult, 1)
 
-	// Calculate total queue size before adding this query
+	// Calculate current queue size
 	totalQueueSize := 0
 	for _, item := range q.queue {
 		totalQueueSize += item.Size
 	}
 	
-	// Add the query to the queue
+	// Add query to queue
 	querySize := len(query)
 	q.queue = append(q.queue, QueryQueueItem{
 		Query:      query,
@@ -181,7 +189,7 @@ func (q *QueryQueue) AddQuery(query string) chan QueryResult {
 	// Update total queue size
 	totalQueueSize += querySize
 	
-	// Log queue size at most once per second
+	// Log queue size (rate limited)
 	triggerBatchNow := false
 	if time.Since(q.lastLogTime) > time.Second {
 		log.Printf("QUEUE STATUS: %d items, %.2f KB total (%.1f%% of max batch size)", 
@@ -189,25 +197,31 @@ func (q *QueryQueue) AddQuery(query string) chan QueryResult {
 		q.lastLogTime = time.Now()
 	}
 	
-	// If queue exceeds max batch size, trigger batch creation immediately and reset timer
-	if totalQueueSize >= MaxBatchSizeBytes {
+	// Only trigger a batch if we're not already creating one
+	if totalQueueSize >= MaxBatchSizeBytes && !q.creatingBatch {
 		log.Printf("QUEUE FULL: Total size %.2f KB exceeds max batch size - triggering immediate batch creation", 
 			float64(totalQueueSize)/1024)
 		triggerBatchNow = true
 		
+		// Set the flag to prevent multiple concurrent batch creations
+		q.creatingBatch = true
+		
 		// Reset the batch interval timer
 		q.resetBatchTimer()
+	} else if totalQueueSize >= MaxBatchSizeBytes {
+		log.Printf("QUEUE FULL: Total size %.2f KB exceeds max batch size but batch creation already in progress", 
+			float64(totalQueueSize)/1024)
 	}
 	
-	// Signal that something has been added to the queue
+	// Signal batch processor (even if not triggering now)
 	q.processCond.Signal()
 	
-	// Unlock before triggering batch to avoid deadlock
 	q.mutex.Unlock()
 	
-	// If the queue is full, trigger batch creation immediately, but only for the full portion
+	// If we decided to trigger a batch, do it without the lock held
 	if triggerBatchNow {
-		go q.createSizedBatch(MaxBatchSizeBytes)
+		// Use direct call instead of goroutine to ensure sequential processing
+		q.createSizedBatch(MaxBatchSizeBytes)
 	}
 	
 	return resultChan
@@ -231,20 +245,32 @@ func (q *QueryQueue) processQueue() {
 		case <-q.ctx.Done():
 			return
 		case <-ticker.C:
+			// Check if we're already creating a batch before proceeding
+			q.mutex.Lock()
+			if q.creatingBatch {
+				log.Printf("BATCH TIMER: Timer triggered but batch creation already in progress, skipping")
+				q.mutex.Unlock()
+				continue
+			}
+			// Set the flag to prevent concurrent batch creation
+			q.creatingBatch = true
+			q.mutex.Unlock()
+
 			log.Printf("BATCH TRIGGER: Timer interval of %v elapsed", q.batchInterval)
 			q.createBatch()
 		}
 	}
 }
 
-// createBatch creates a batch of queries from the queue
+// createBatch creates a batch of queries from the queue based on timer interval
 func (q *QueryQueue) createBatch() {
 	q.mutex.Lock()
-	defer q.mutex.Unlock()
 	
 	// If queue is empty, nothing to do
 	if len(q.queue) == 0 {
 		log.Printf("BATCH INFO: No items in queue, skipping batch creation")
+		q.creatingBatch = false
+		q.mutex.Unlock()
 		return
 	}
 
@@ -257,66 +283,51 @@ func (q *QueryQueue) createBatch() {
 			oldestItemTime = item.AddedAt
 		}
 	}
-
-	// We'll still log batch creation details, but only when batches are actually created
-	if len(q.queue) > 0 {
-		oldestItemAge := time.Since(oldestItemTime)
-		log.Printf("BATCH PREPARE: Queue has %d items, total size %.2f KB, oldest item age: %v", 
-			len(q.queue), float64(totalQueueSize)/1024, oldestItemAge)
-	}
 	
-	// Create batches respecting the max size limit
-	var batches [][]QueryQueueItem
-	var currentBatch []QueryQueueItem
-	var currentBatchSize int
-
-	for _, item := range q.queue {
-		// If this item would exceed the batch size, start a new batch
-		if currentBatchSize+item.Size > MaxBatchSizeBytes {
-			if len(currentBatch) > 0 {
-				batches = append(batches, currentBatch)
-				currentBatch = []QueryQueueItem{}
-				currentBatchSize = 0
-			}
-			
-			// If a single item is larger than max batch size, we need to handle it separately
-			if item.Size > MaxBatchSizeBytes {
-				log.Printf("WARNING: Query exceeds max batch size (%d bytes)", item.Size)
-				// Create a batch with just this item
-				batches = append(batches, []QueryQueueItem{item})
-				continue
-			}
-		}
+	oldestItemAge := time.Since(oldestItemTime)
+	avgItemSize := float64(totalQueueSize) / float64(len(q.queue))
+	
+	log.Printf("TIMER BATCH: Queue has %d items, total size %.2f KB, oldest item age: %v, avg item size: %.0f bytes", 
+		len(q.queue), float64(totalQueueSize)/1024, oldestItemAge, avgItemSize)
+	
+	// Check if we should create a sized batch instead of a timer-based batch
+	if totalQueueSize > MaxBatchSizeBytes {
+		log.Printf("BATCH SIZE EXCEEDED: Queue size %.2f KB exceeds max batch size (%.2f KB), using sized batch instead", 
+			float64(totalQueueSize)/1024, float64(MaxBatchSizeBytes)/1024)
 		
-		// Add item to current batch
-		currentBatch = append(currentBatch, item)
-		currentBatchSize += item.Size
+		// Release the lock before calling createSizedBatch
+		q.mutex.Unlock()
+		
+		// Create a sized batch instead - createSizedBatch will handle the creatingBatch flag
+		q.createSizedBatch(MaxBatchSizeBytes)
+		return
 	}
 	
-	// Add the last batch if it's not empty
-	if len(currentBatch) > 0 {
-		batches = append(batches, currentBatch)
+	// Create a timer-based batch with all items currently in the queue
+	batch := q.queue
+	
+	// Calculate batch size for logging
+	batchSize := 0
+	for _, item := range batch {
+		batchSize += item.Size
 	}
 	
 	// Clear the queue
-	q.queue = []QueryQueueItem{}
+	q.queue = make([]QueryQueueItem, 0)
 	
-	// Add new batches to the ready queue
-	if len(batches) > 0 {
-		// Calculate and log size information for each batch
-		for i, batch := range batches {
-			batchSize := 0
-			for _, item := range batch {
-				batchSize += item.Size
-			}
-			log.Printf("BATCH DETAIL: Batch #%d contains %d items, size: %.2f KB (%.1f%% of max)", 
-				i+1, len(batch), float64(batchSize)/1024, (float64(batchSize)/float64(MaxBatchSizeBytes))*100)
-		}
-		q.readyBatches = append(q.readyBatches, batches...)
-		log.Printf("BATCH SUMMARY: Created %d new batches, total ready batches: %d", len(batches), len(q.readyBatches))
-	} else {
-		log.Printf("BATCH INFO: No batches created from queue of %d items", len(q.queue))
-	}
+	// Log batch creation by timer
+	log.Printf("TIMER BATCH CREATED: %d items, %.2f KB (%.1f%% of max), 0 items remain in queue", 
+		len(batch), float64(batchSize)/1024, (float64(batchSize)/float64(MaxBatchSizeBytes))*100)
+	
+	// Add batch to ready batches
+	q.readyBatches = append(q.readyBatches, batch)
+	
+	// Reset the batch interval timer
+	q.resetBatchTimer()
+	
+	// Reset the creating batch flag before releasing the lock
+	q.creatingBatch = false
+	q.mutex.Unlock()
 }
 
 // submitBatch submits a single batch of queries to Celestia
@@ -392,11 +403,15 @@ func (q *QueryQueue) resetBatchTimer() {
 // createSizedBatch creates a batch up to the specified maximum size
 func (q *QueryQueue) createSizedBatch(maxSizeBytes int) {
 	q.mutex.Lock()
-	defer q.mutex.Unlock()
+	
+	// Note: We don't use defer q.mutex.Unlock() here because we want to ensure creatingBatch is always reset,
+	// even if the function panics (which it shouldn't, but better to be safe)
 	
 	// If queue is empty, nothing to do
 	if len(q.queue) == 0 {
 		log.Printf("BATCH INFO: No items in queue, skipping sized batch creation")
+		q.creatingBatch = false
+		q.mutex.Unlock()
 		return
 	}
 
@@ -452,9 +467,16 @@ func (q *QueryQueue) createSizedBatch(maxSizeBytes int) {
 		
 		// Add batch to ready batches
 		q.readyBatches = append(q.readyBatches, batch)
+		
+		// Reset the timer to prevent another batch from being created immediately
+		q.resetBatchTimer()
 	} else {
 		log.Printf("SIZED BATCH SKIPPED: No suitable items found for batch creation")
 	}
+	
+	// Always reset the creating batch flag when we're done
+	q.creatingBatch = false
+	q.mutex.Unlock()
 }
 
 // submitBatches runs in the background and submits ready batches in sequence

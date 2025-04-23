@@ -125,6 +125,10 @@ The project consists of three main components:
 2. **SQL Manager**: Manages the SQLite database and executes SQL queries.
 3. **Celestia Manager**: Interfaces with the Celestia blockchain to store and retrieve queries.
 
+## Security Notice
+
+⚠️ **IMPORTANT**: This code has not undergone formal security auditing and is intended as a non-production ready proof-of-concept. It should not be used in production environments or for storing sensitive data. The security mechanisms, while implemented with best intentions, have not been verified by security professionals.
+
 ## License
 
 MIT

@@ -16,17 +16,12 @@ type Manager struct {
 	queryCount int // Number of processed queries
 }
 
-// NewManager creates a new SQL manager
+// NewManager creates a new SQL manager with security restrictions
 func NewManager(dbPath string) (*Manager, error) {
-	db, err := sql.Open("sqlite3", dbPath)
+	// Use our secure connection with the SQLite authorizer
+	db, err := GetSecureDBConnection(dbPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open database: %w", err)
-	}
-
-	// Test database connection
-	if err := db.Ping(); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("failed to connect to database: %w", err)
+		return nil, fmt.Errorf("failed to open secure database: %w", err)
 	}
 
 	return &Manager{

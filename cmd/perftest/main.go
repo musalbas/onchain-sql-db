@@ -467,95 +467,88 @@ func createTestTable(serverURL, tableName string) error {
 	return nil
 }
 
-// Submit a batch of inserts
+// Submit a batch of inserts, with each record as its own INSERT statement
 func submitBatch(ctx context.Context, serverURL string, batch *InsertBatch, tableName string) error {
-	// Construct a batch INSERT statement
-	var insertSQL string
-	if len(batch.Records) == 1 {
-		// Single insert
-		record := batch.Records[0]
-		insertSQL = fmt.Sprintf("INSERT INTO %s (id, value) VALUES (%d, '%s')",
-			tableName, record.ID, record.Value)
-	} else {
-		// Multi-value insert
-		insertSQL = fmt.Sprintf("INSERT INTO %s (id, value) VALUES ", tableName)
-		for i, record := range batch.Records {
-			if i > 0 {
-				insertSQL += ", "
-			}
-			insertSQL += fmt.Sprintf("(%d, '%s')", record.ID, record.Value)
-		}
-	}
-
-	// Print the actual SQL statement for debug purposes
-	fmt.Printf("DEBUG: Executing SQL: %s\n", insertSQL)
-
-	// Send request to insert records
-	queryReq := QueryRequest{Query: insertSQL}
-	reqBody, err := json.Marshal(queryReq)
-	if err != nil {
-		return fmt.Errorf("failed to marshal insert request: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, serverURL+"/query", bytes.NewBuffer(reqBody))
-	if err != nil {
-		return fmt.Errorf("failed to create HTTP request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
 	submitTime := time.Now()
-	for _, record := range batch.Records {
-		record.SubmitTime = submitTime
-	}
-
 	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to send insert request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("server returned non-OK status: %s, body: %s", resp.Status, string(respBody))
-	}
-
-	var response QueryResponse
-	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
-		return fmt.Errorf("failed to decode insert response: %w", err)
-	}
-
-	if !response.Success {
-		return fmt.Errorf("insert failed: %s", response.Error)
-	}
-
-	// Print response details for debugging
-	fmt.Printf("DEBUG: Server response: success=%v, height=%d, message=%s\n", 
-		response.Success, response.Height, response.Message)
-
-	// Get the current status to use as a reference point
+	
+	// Get initial server status
 	status, err := getServerStatus(serverURL)
 	if err != nil {
 		fmt.Printf("WARNING: Failed to get server status: %v\n", err)
 	}
-
-	// Record the reference height for tracking
+	
 	currentHeight := uint64(0)
 	if status != nil {
 		currentHeight = status.CurrentHeight
 	}
-	if response.Height > 0 && response.Height > currentHeight {
-		currentHeight = response.Height
-	}
-
-	// Record the height at which this batch was submitted
+	
+	// Submit each record as its own INSERT statement
 	for _, record := range batch.Records {
+		// Create individual INSERT for this record
+		insertSQL := fmt.Sprintf("INSERT INTO %s (id, value) VALUES (%d, '%s')",
+			tableName, record.ID, record.Value)
+		
+		// Print the SQL for debug purposes
+		fmt.Printf("DEBUG: Executing individual SQL: %s\n", insertSQL)
+		
+		// Send request to insert this record
+		queryReq := QueryRequest{Query: insertSQL}
+		reqBody, err := json.Marshal(queryReq)
+		if err != nil {
+			return fmt.Errorf("failed to marshal insert request: %w", err)
+		}
+		
+		req, err := http.NewRequestWithContext(ctx, http.MethodPut, serverURL+"/query", bytes.NewBuffer(reqBody))
+		if err != nil {
+			return fmt.Errorf("failed to create HTTP request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		
+		// Set submission time
+		record.SubmitTime = submitTime
+		
+		// Send the request
+		resp, err := client.Do(req)
+		if err != nil {
+			return fmt.Errorf("failed to send insert request: %w", err)
+		}
+		
+		// Check response
+		if resp.StatusCode != http.StatusOK {
+			respBody, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			return fmt.Errorf("server returned non-OK status: %s, body: %s", resp.Status, string(respBody))
+		}
+		
+		// Parse response
+		var response QueryResponse
+		if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+			resp.Body.Close()
+			return fmt.Errorf("failed to decode insert response: %w", err)
+		}
+		resp.Body.Close()
+		
+		if !response.Success {
+			return fmt.Errorf("insert failed: %s", response.Error)
+		}
+		
+		// Print response details
+		fmt.Printf("DEBUG: Record %d response: success=%v, height=%d, message=%s\n", 
+			record.ID, response.Success, response.Height, response.Message)
+		
+		// Update height if available from response
+		if response.Height > 0 && response.Height > currentHeight {
+			currentHeight = response.Height
+		}
+		
+		// Assign current tracking height to the record
 		record.Height = currentHeight
 	}
 	
-	// Log the height assignment
-	fmt.Printf("DEBUG: Assigned height %d to records\n", currentHeight)
-
+	// Log the height assignment for the batch
+	fmt.Printf("DEBUG: Assigned height %d to batch records\n", currentHeight)
+	
 	return nil
 }
 

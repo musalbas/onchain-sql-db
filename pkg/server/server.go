@@ -29,6 +29,7 @@ type Server struct {
 	sqlManager      *sql.Manager
 	celestiaManager *celestia.Manager
 	blockProcessor  *BlockProcessor
+	queryQueue      *QueryQueue
 	mutex           sync.Mutex
 }
 
@@ -50,10 +51,14 @@ func NewServer(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("failed to create Celestia manager: %w", err)
 	}
 
+	// Create the query queue
+	queryQueue := NewQueryQueue(celestiaManager, 2*time.Second)
+
 	// Create the server instance
 	server := &Server{
 		sqlManager:      sqlManager,
 		celestiaManager: celestiaManager,
+		queryQueue:      queryQueue,
 	}
 	
 	// Create and attach the block processor
@@ -63,6 +68,7 @@ func NewServer(cfg Config) (*Server, error) {
 	// Create HTTP server
 	mux := http.NewServeMux()
 	mux.HandleFunc("/query", server.handleQuery)
+	mux.HandleFunc("/batch", server.handleBatch)
 	mux.HandleFunc("/replay", server.handleReplay)
 	mux.HandleFunc("/status", server.handleStatus)
 
@@ -74,8 +80,11 @@ func NewServer(cfg Config) (*Server, error) {
 	return server, nil
 }
 
-// Start starts the HTTP server and block processor
+// Start starts the HTTP server, block processor, and query queue
 func (s *Server) Start() error {
+	// Start the query queue
+	s.queryQueue.Start()
+
 	// Start the block processor
 	s.blockProcessor.Start()
 	
@@ -83,7 +92,7 @@ func (s *Server) Start() error {
 	return s.httpServer.ListenAndServe()
 }
 
-// Stop stops the HTTP server and block processor
+// Stop stops the HTTP server, block processor, and query queue
 func (s *Server) Stop() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -92,6 +101,9 @@ func (s *Server) Stop() {
 	if err := s.httpServer.Shutdown(ctx); err != nil {
 		log.Printf("Failed to shutdown server: %v", err)
 	}
+
+	// Stop the query queue
+	s.queryQueue.Stop()
 
 	// Stop the block processor
 	s.blockProcessor.Stop()
@@ -110,6 +122,11 @@ type QueryRequest struct {
 	Query string `json:"query"`
 }
 
+// BatchRequest represents a batch of SQL queries
+type BatchRequest struct {
+	Queries []string `json:"queries"`
+}
+
 // QueryResponse represents an SQL query response
 type QueryResponse struct {
 	Success bool            `json:"success"`
@@ -117,6 +134,15 @@ type QueryResponse struct {
 	Height  uint64          `json:"height,omitempty"`
 	Error   string          `json:"error,omitempty"`
 	Message string          `json:"message,omitempty"`
+}
+
+// BatchResponse represents a response for a batch of queries
+type BatchResponse struct {
+	Success bool   `json:"success"`
+	Height  uint64 `json:"height,omitempty"`
+	Count   int    `json:"count"`
+	Error   string `json:"error,omitempty"`
+	Message string `json:"message,omitempty"`
 }
 
 // ReplayRequest represents a replay request
@@ -155,19 +181,14 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		}
 		query = req.Query
 
-		// Submit the query to Celestia, but don't execute it locally
-		// It will be executed by the block processor in the correct order
-		height, err := s.celestiaManager.SubmitQuery(r.Context(), query)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Failed to submit query: %v", err), http.StatusInternalServerError)
-			return
-		}
-
-		// Return response with the block height (but no results yet)
+		// Add the query to the queue without waiting for the result
+		// This makes the API non-blocking while still batching queries
+		s.queryQueue.AddQuery(query)
+		
+		// Return immediate success response without waiting for blockchain submission
 		json.NewEncoder(w).Encode(QueryResponse{
 			Success: true,
-			Height:  height,
-			Message: "Query submitted to blockchain and will be processed in order",
+			Message: "Query added to submission queue and will be processed in batches",
 		})
 		return
 	}
@@ -300,6 +321,42 @@ func (s *Server) handleReplay(w http.ResponseWriter, r *http.Request) {
 	}
 
 	json.NewEncoder(w).Encode(replayResults)
+}
+
+// handleBatch handles batch SQL query requests
+func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse the batch request
+	var req BatchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Validate the request
+	if len(req.Queries) == 0 {
+		http.Error(w, "No queries provided", http.StatusBadRequest)
+		return
+	}
+
+	// Add all queries to the queue at once without waiting for results
+	for _, query := range req.Queries {
+		s.queryQueue.AddQuery(query)
+	}
+
+	// Return immediate success response with batch info
+	json.NewEncoder(w).Encode(BatchResponse{
+		Success: true,
+		Count:   len(req.Queries),
+		Message: fmt.Sprintf("%d queries added to submission queue and will be processed in batches", len(req.Queries)),
+	})
 }
 
 // handleStatus returns the current status of the node

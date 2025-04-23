@@ -3,7 +3,9 @@ package celestia
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,6 +23,7 @@ type Manager struct {
 	queryBlockCache map[uint64][]string // Cache of queries by block height
 	cacheExpiry     time.Duration
 	cacheLastUpdate map[uint64]time.Time
+	maxBlobSize     int               // Maximum allowed blob size in bytes
 }
 
 // NewManager creates a new Celestia manager
@@ -55,6 +58,7 @@ func NewManager(url, token, namespaceHex string) (*Manager, error) {
 		queryBlockCache: make(map[uint64][]string),
 		cacheExpiry:     5 * time.Minute,
 		cacheLastUpdate: make(map[uint64]time.Time),
+		maxBlobSize:     30 * 1024 * 1024, // 30MB default max blob size
 	}
 
 	return manager, nil
@@ -119,6 +123,25 @@ func (m *Manager) SubmitQuery(ctx context.Context, query string) (uint64, error)
 	}
 
 	return height, nil
+}
+
+// ParseBatchedQueries parses a batched query string that contains multiple SQL queries
+// The batch format is a JSON array of strings: ["query1", "query2", ...]
+func ParseBatchedQueries(batchedQuery string) ([]string, error) {
+	// Check if the query looks like a JSON array
+	batchedQuery = strings.TrimSpace(batchedQuery)
+	if !strings.HasPrefix(batchedQuery, "[") || !strings.HasSuffix(batchedQuery, "]") {
+		// Not a batch, return as a single query
+		return []string{batchedQuery}, nil
+	}
+	
+	// Parse the JSON array
+	var queries []string
+	if err := json.Unmarshal([]byte(batchedQuery), &queries); err != nil {
+		return nil, fmt.Errorf("failed to parse batched query: %w", err)
+	}
+	
+	return queries, nil
 }
 
 // GetQueriesAtHeight retrieves all queries at a specific block height with caching

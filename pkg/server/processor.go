@@ -144,11 +144,21 @@ func (p *BlockProcessor) processNewBlocks() error {
 			// If there are queries, execute them
 			if exists && len(queries) > 0 {
 				log.Printf("Processing %d queries at height %d", len(queries), height)
-				for _, query := range queries {
-					if _, err := p.sqlManager.ExecuteQueryWithTx(query, tx); err != nil {
-						log.Printf("Error executing query at height %d: %v", height, err)
-						// Continue processing even if a query fails
-						// This ensures we don't get stuck on a bad query
+				for _, queryStr := range queries {
+					// Check if this is a batched query and parse it if so
+					parsedQueries, err := celestia.ParseBatchedQueries(queryStr)
+					if err != nil {
+						log.Printf("Error parsing batched query at height %d: %v", height, err)
+						continue
+					}
+					
+					// Execute each query in the batch
+					for _, query := range parsedQueries {
+						if _, err := p.sqlManager.ExecuteQueryWithTx(query, tx); err != nil {
+							log.Printf("Error executing query at height %d: %v", height, err)
+							// Continue processing even if a query fails
+							// This ensures we don't get stuck on a bad query
+						}
 					}
 				}
 			}
@@ -184,11 +194,21 @@ func (p *BlockProcessor) processBlocksSequentially(startHeight, endHeight uint64
 			// If there are queries, execute them
 			if len(queries) > 0 {
 				log.Printf("Processing %d queries at height %d", len(queries), height)
-				for _, query := range queries {
-					if _, err := p.sqlManager.ExecuteQueryWithTx(query, tx); err != nil {
-						log.Printf("Error executing query at height %d: %v", height, err)
-						// Continue processing even if a query fails
-						// This ensures we don't get stuck on a bad query
+				for _, queryStr := range queries {
+					// Check if this is a batched query and parse it if so
+					parsedQueries, err := celestia.ParseBatchedQueries(queryStr)
+					if err != nil {
+						log.Printf("Error parsing batched query at height %d: %v", height, err)
+						continue
+					}
+					
+					// Execute each query in the batch
+					for _, query := range parsedQueries {
+						if _, err := p.sqlManager.ExecuteQueryWithTx(query, tx); err != nil {
+							log.Printf("Error executing query at height %d: %v", height, err)
+							// Continue processing even if a query fails
+							// This ensures we don't get stuck on a bad query
+						}
 					}
 				}
 			}

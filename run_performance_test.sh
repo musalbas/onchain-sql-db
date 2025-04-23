@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# Generate a random table name with timestamp and random string
+RANDOM_SUFFIX=$(date +%Y%m%d%H%M%S)_$(cat /dev/urandom | tr -dc 'a-z0-9' | fold -w 8 | head -n 1)
+
 # Default configuration
 SERVER_URL="http://localhost:8080"
 RECORDS=1000
@@ -8,7 +11,7 @@ BATCH_SIZE=20
 POLL_CONCURRENCY=20
 TIMEOUT="10m"
 POLL_INTERVAL="200ms"
-TEST_TABLE="perftest"
+TEST_TABLE="perftest_${RANDOM_SUFFIX}"
 VERBOSE=false
 
 # Parse command line arguments

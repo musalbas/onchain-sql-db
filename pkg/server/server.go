@@ -28,6 +28,7 @@ type Server struct {
 	httpServer      *http.Server
 	sqlManager      *sql.Manager
 	celestiaManager *celestia.Manager
+	blockProcessor  *BlockProcessor
 	mutex           sync.Mutex
 }
 
@@ -49,10 +50,15 @@ func NewServer(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("failed to create Celestia manager: %w", err)
 	}
 
+	// Create the server instance
 	server := &Server{
 		sqlManager:      sqlManager,
 		celestiaManager: celestiaManager,
 	}
+	
+	// Create and attach the block processor
+	blockProcessor := NewBlockProcessor(sqlManager, celestiaManager)
+	server.blockProcessor = blockProcessor
 
 	// Create HTTP server
 	mux := http.NewServeMux()
@@ -68,19 +74,27 @@ func NewServer(cfg Config) (*Server, error) {
 	return server, nil
 }
 
-// Start starts the HTTP server
+// Start starts the HTTP server and block processor
 func (s *Server) Start() error {
+	// Start the block processor
+	s.blockProcessor.Start()
+	
+	// Start the HTTP server
 	return s.httpServer.ListenAndServe()
 }
 
-// Stop stops the HTTP server
+// Stop stops the HTTP server and block processor
 func (s *Server) Stop() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
+	// Stop the HTTP server
 	if err := s.httpServer.Shutdown(ctx); err != nil {
 		log.Printf("Failed to shutdown server: %v", err)
 	}
+
+	// Stop the block processor
+	s.blockProcessor.Stop()
 
 	// Close database
 	if err := s.sqlManager.Close(); err != nil {
@@ -102,6 +116,7 @@ type QueryResponse struct {
 	Results [][]interface{} `json:"results,omitempty"`
 	Height  uint64          `json:"height,omitempty"`
 	Error   string          `json:"error,omitempty"`
+	Message string          `json:"message,omitempty"`
 }
 
 // ReplayRequest represents a replay request
@@ -113,6 +128,7 @@ type ReplayRequest struct {
 // StatusResponse represents the current status
 type StatusResponse struct {
 	CurrentHeight      uint64 `json:"current_height"`
+	ProcessedHeight    uint64 `json:"processed_height"`
 	ProcessedQueries   int    `json:"processed_queries"`
 	CelestiaNamespace  string `json:"celestia_namespace"`
 	CelestiaConnection bool   `json:"celestia_connection"`
@@ -139,29 +155,19 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		}
 		query = req.Query
 
-		// Submit the query to Celestia
+		// Submit the query to Celestia, but don't execute it locally
+		// It will be executed by the block processor in the correct order
 		height, err := s.celestiaManager.SubmitQuery(r.Context(), query)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("Failed to submit query: %v", err), http.StatusInternalServerError)
 			return
 		}
 
-		// Execute the query locally
-		results, err := s.sqlManager.ExecuteQuery(query)
-		if err != nil {
-			// We still return 200 since the query was successfully submitted to Celestia
-			json.NewEncoder(w).Encode(QueryResponse{
-				Success: false,
-				Height:  height,
-				Error:   err.Error(),
-			})
-			return
-		}
-
+		// Return response with the block height (but no results yet)
 		json.NewEncoder(w).Encode(QueryResponse{
 			Success: true,
-			Results: results,
 			Height:  height,
+			Message: "Query submitted to blockchain and will be processed in order",
 		})
 		return
 	}
@@ -315,8 +321,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Failed to get query count: %v", err)
 	}
 
+	processedHeight := s.blockProcessor.GetLastProcessedHeight()
+	
 	resp := StatusResponse{
 		CurrentHeight:      height,
+		ProcessedHeight:    processedHeight,
 		ProcessedQueries:   count,
 		CelestiaNamespace:  s.celestiaManager.GetNamespace(),
 		CelestiaConnection: s.celestiaManager.IsConnected(),

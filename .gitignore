@@ -5,6 +5,7 @@
 *.so
 *.dylib
 onchain-sql-db
+perftest
 
 # Test binary, built with `go test -c`
 *.test

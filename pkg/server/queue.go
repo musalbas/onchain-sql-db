@@ -68,7 +68,7 @@ func NewQueryQueue(celestiaManager *celestia.Manager, batchInterval time.Duratio
 		ctx:                 ctx,
 		cancel:              cancel,
 		activeSubmissions:   0,
-		maxParallelBatches:  100, // Allow up to 100 parallel batch submissions
+		maxParallelBatches:  5, // Set to 5 parallel batch submissions
 		lastLogTime:         time.Now(),
 		creatingBatch:       false,
 	}

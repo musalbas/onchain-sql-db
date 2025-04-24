@@ -11,9 +11,13 @@ import (
 )
 
 const (
-	// MaxBatchSizeBytes represents maximum size of a batch in bytes (1.88MB)
-	// Set slightly below Celestia's limit of 1,974,272 bytes
-	MaxBatchSizeBytes = 1_900_000
+	// MaxBatchSizeBytes represents maximum size of a batch in bytes (30MB for user perspective)
+	// This is the max total batch size we allow, but we'll split into multiple Celestia blobs internally
+	MaxBatchSizeBytes = 30 * 1024 * 1024
+	
+	// CelestiaBlobSizeLimit is the maximum size of a blob that can be submitted to Celestia
+	// Celestia enforces this limit at the node level
+	CelestiaBlobSizeLimit = 1_900_000
 	// DefaultBatchInterval represents the default time to wait before processing a batch
 	// Set to 3s for more frequent batch processing while still being reasonable for Celestia
 	DefaultBatchInterval = 3 * time.Second

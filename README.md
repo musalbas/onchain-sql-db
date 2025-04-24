@@ -155,9 +155,21 @@ The project consists of four main components:
 1. **HTTP Server**: Handles API requests and coordinates between the SQL and Celestia managers.
 2. **SQL Manager**: Manages the SQLite database and executes SQL queries.
 3. **Celestia Manager**: Interfaces with the Celestia blockchain to store and retrieve queries.
-4. **Query Queue**: Batches queries for efficient submission to the Celestia blockchain, significantly improving throughput.
+4. **Query Queue**: Batches queries for efficient submission to the Celestia blockchain, significantly improving throughput. Supports batch sizes up to 30MB (modified from Celestia's default 1.97MB limit).
 
 
+
+## Special Features
+
+### 30MB Blob Support
+
+This fork of the project includes a modified version of the Celestia client that supports blob submissions up to 30MB in size (increased from the default 1.97MB limit). This is implemented via vendoring the celestia-openrpc library and modifying the blob size validation.
+
+To build the project with this feature, use the `-mod=vendor` flag:
+
+```bash
+go build -mod=vendor
+```
 
 ## License
 

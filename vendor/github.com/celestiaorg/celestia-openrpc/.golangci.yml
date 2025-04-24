@@ -1,0 +1,29 @@
+run:
+  timeout: 5m
+  modules-download-mode: readonly
+
+linters:
+  enable:
+    - errcheck
+    - gofmt
+    - goimports
+    - gosec
+    - gosimple
+    - govet
+    - ineffassign
+    - misspell
+    - revive
+    - staticcheck
+    - typecheck
+    - unused
+
+issues:
+  exclude-use-default: false
+
+linters-settings:
+  revive:
+    rules:
+      - name: package-comments
+        disabled: true
+  goimports:
+    local-prefixes: github.com/celestia

@@ -36,19 +36,20 @@ type QueryResult struct {
 
 // QueryQueue handles batching of SQL queries before submission to Celestia
 type QueryQueue struct {
-	celestiaManager *celestia.Manager
-	queue           []QueryQueueItem   // Primary queue for incoming queries
-	readyBatches    [][]QueryQueueItem // Batches ready for submission
-	mutex           sync.Mutex
-	batchInterval   time.Duration
-	batchTicker     *time.Ticker    // Ticker for batch interval, can be reset
-	ctx             context.Context
-	cancel          context.CancelFunc
-	wg              sync.WaitGroup
-	processing      bool           // Flag to indicate if a batch is currently being submitted
-	processCond     *sync.Cond     // Condition variable for coordinating batch processing
-	lastLogTime     time.Time      // Tracks when we last logged queue stats to limit frequency
-	creatingBatch   bool           // Flag to indicate if we're currently creating a sized batch
+	celestiaManager     *celestia.Manager
+	queue               []QueryQueueItem   // Primary queue for incoming queries
+	readyBatches        [][]QueryQueueItem // Batches ready for submission
+	mutex               sync.Mutex
+	batchInterval       time.Duration
+	batchTicker         *time.Ticker    // Ticker for batch interval, can be reset
+	ctx                 context.Context
+	cancel              context.CancelFunc
+	wg                  sync.WaitGroup
+	activeSubmissions   int             // Counter for active batch submissions
+	maxParallelBatches  int             // Maximum number of batches to process in parallel
+	processCond         *sync.Cond      // Condition variable for coordinating batch processing
+	lastLogTime         time.Time       // Tracks when we last logged queue stats to limit frequency
+	creatingBatch       bool            // Flag to indicate if we're currently creating a sized batch
 }
 
 // NewQueryQueue creates a new query queue
@@ -60,15 +61,16 @@ func NewQueryQueue(celestiaManager *celestia.Manager, batchInterval time.Duratio
 	ctx, cancel := context.WithCancel(context.Background())
 	
 	q := &QueryQueue{
-		celestiaManager: celestiaManager,
-		queue:           make([]QueryQueueItem, 0),
-		readyBatches:    make([][]QueryQueueItem, 0),
-		batchInterval:   batchInterval,
-		ctx:             ctx,
-		cancel:          cancel,
-		processing:      false,
-		lastLogTime:     time.Now(),
-		creatingBatch:   false,
+		celestiaManager:     celestiaManager,
+		queue:               make([]QueryQueueItem, 0),
+		readyBatches:        make([][]QueryQueueItem, 0),
+		batchInterval:       batchInterval,
+		ctx:                 ctx,
+		cancel:              cancel,
+		activeSubmissions:   0,
+		maxParallelBatches:  100, // Allow up to 100 parallel batch submissions
+		lastLogTime:         time.Now(),
+		creatingBatch:       false,
 	}
 	
 	// Initialize condition variable with queue mutex
@@ -497,45 +499,59 @@ func (q *QueryQueue) submitBatches() {
 	}
 }
 
-// processBatchQueue processes the next batch in the queue if available
+// processBatchQueue processes the next batch(es) in the queue if available
 func (q *QueryQueue) processBatchQueue() {
 	q.mutex.Lock()
 	
-	// If no batches or already processing, nothing to do
-	if len(q.readyBatches) == 0 || q.processing {
+	// If no batches or reached max parallel submissions, nothing to do
+	if len(q.readyBatches) == 0 || q.activeSubmissions >= q.maxParallelBatches {
 		q.mutex.Unlock()
 		return
 	}
 	
-	// Mark as processing and get the next batch
-	q.processing = true
+	// Get the next batch
 	batch := q.readyBatches[0]
 	q.readyBatches = q.readyBatches[1:]
+	
+	// Increment active submissions counter
+	q.activeSubmissions++
 	
 	// Unlock before submitting to avoid holding the lock during network operations
 	q.mutex.Unlock()
 	
-	// Submit the batch
-	batchSize := 0
-	for _, item := range batch {
-		batchSize += item.Size
-	}
-	log.Printf("BATCH SUBMIT: Submitting batch of %d items, size: %.2f KB (%.1f%% of max)", 
-		len(batch), float64(batchSize)/1024, (float64(batchSize)/float64(MaxBatchSizeBytes))*100)
+	// Create a goroutine to submit the batch in parallel
+	q.wg.Add(1)
+	go func(batchToSubmit []QueryQueueItem) {
+		defer q.wg.Done()
+		
+		// Submit the batch
+		batchSize := 0
+		for _, item := range batchToSubmit {
+			batchSize += item.Size
+		}
+		log.Printf("BATCH SUBMIT: Submitting batch of %d items, size: %.2f KB (%.1f%% of max)", 
+			len(batchToSubmit), float64(batchSize)/1024, (float64(batchSize)/float64(MaxBatchSizeBytes))*100)
+		
+		submitStartTime := time.Now()
+		err := q.submitBatch(batchToSubmit)
+		submitDuration := time.Since(submitStartTime)
+		
+		// Update active submissions counter and signal waiting goroutines
+		q.mutex.Lock()
+		q.activeSubmissions--
+		q.processCond.Broadcast() // Signal that a submission completed
+		q.mutex.Unlock()
+		
+		if err != nil {
+			log.Printf("BATCH ERROR: Failed to submit batch after %v: %v", submitDuration, err)
+		} else {
+			log.Printf("BATCH SUCCESS: Batch submitted successfully in %v", submitDuration)
+		}
+		
+		// Try to process more batches if available
+		q.processBatchQueue()
+	}(batch)
 	
-	submitStartTime := time.Now()
-	err := q.submitBatch(batch)
-	submitDuration := time.Since(submitStartTime)
-	
-	// Update processing state and signal waiting goroutines
-	q.mutex.Lock()
-	q.processing = false
-	q.processCond.Broadcast() // Signal that processing is complete
-	q.mutex.Unlock()
-	
-	if err != nil {
-		log.Printf("BATCH ERROR: Failed to submit batch after %v: %v", submitDuration, err)
-	} else {
-		log.Printf("BATCH SUCCESS: Batch submitted successfully in %v", submitDuration)
-	}
+	// Check if we can process more batches in parallel
+	q.processBatchQueue()
 }

@@ -458,7 +458,7 @@ func createBatches(records []*InsertRecord, batchSize int) []*InsertBatch {
 	return batches
 }
 
-// Create the test table in the database
+// Create the test table in the database and wait for it to be confirmed
 func createTestTable(serverURL, tableName string) error {
 	// Construct query to create test table if it doesn't exist
 	createTableSQL := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (id INTEGER PRIMARY KEY, value TEXT)`, tableName)
@@ -496,7 +496,31 @@ func createTestTable(serverURL, tableName string) error {
 		return fmt.Errorf("create table failed: %s", response.Error)
 	}
 
-	return nil
+	// Now wait for the table to be confirmed on-chain and available
+	log.Println("Table creation query submitted, waiting for table to be confirmed...")
+	
+	// Set up a timeout context
+	timeoutCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second) // Extended timeout
+	defer cancel()
+	
+	// Check every second if the table is available
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-timeoutCtx.Done():
+			return fmt.Errorf("timeout waiting for table %s to be confirmed", tableName)
+		case <-ticker.C:
+			// Verify the table exists
+			err := verifyTableExists(serverURL, tableName)
+			if err == nil {
+				log.Printf("Table %s successfully created and verified!", tableName)
+				return nil // Table exists, we can proceed
+			}
+			log.Printf("Waiting for table %s to be confirmed... (%v)", tableName, err)
+		}
+	}
 }
 
 // Submit a batch of inserts using the /batch endpoint
@@ -672,30 +696,125 @@ func checkRecordCommitted(serverURL string, record *InsertRecord, tableName stri
 // Verify that the test table exists
 func verifyTableExists(serverURL, tableName string) error {
 	// Try a simple SELECT query to see if the table exists
-	// This is just for diagnostic purposes
-	query := fmt.Sprintf("SELECT 1 FROM %s LIMIT 1", tableName)
+	query := fmt.Sprintf("SELECT name FROM sqlite_master WHERE type='table' AND name='%s'", tableName)
 
-	// This might fail if the table is empty, which is expected
-	fmt.Printf("Testing if table '%s' exists with query: %s\n", tableName, query)
-	
 	// For GET requests, the API expects the query as a URL parameter
 	url := fmt.Sprintf("%s/query?query=%s", serverURL, url.QueryEscape(query))
 	
 	// Send GET request
 	resp, err := http.Get(url)
 	if err != nil {
-		fmt.Printf("Error checking table existence: %v\n", err)
-		// Continue anyway, we'll create the table
-		return nil
+		return fmt.Errorf("error checking table existence: %v", err)
 	}
 	defer resp.Body.Close()
 	
-	body, _ := io.ReadAll(resp.Body)
-	fmt.Printf("Table check response: Status=%s, Body=%s\n", resp.Status, string(body))
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("server returned non-OK status: %s, body: %s", resp.Status, string(body))
+	}
 	
-	// We're going to continue even if this fails because the CREATE TABLE 
-	// statement uses IF NOT EXISTS
+	// Parse the response
+	var queryResp QueryResponse
+	if err := json.NewDecoder(resp.Body).Decode(&queryResp); err != nil {
+		return fmt.Errorf("failed to decode response: %v", err)
+	}
+	
+	if !queryResp.Success {
+		return fmt.Errorf("query failed: %s", queryResp.Error)
+	}
+	
+	// Check if the table exists in the response
+	if len(queryResp.Results) <= 1 { // Just header row or empty
+		return fmt.Errorf("table %s not found in database", tableName)
+	}
+	
+	// Table exists
 	return nil
+}
+
+// Perform a test insert and verify it can be queried back
+func performTestInsert(serverURL, tableName string) error {
+	// Generate a unique test value
+	testValue := fmt.Sprintf("test_%d", time.Now().UnixNano())
+	
+	// First, try to insert a test record with ID -1 (will be deleted later)
+	insertSQL := fmt.Sprintf("INSERT OR REPLACE INTO %s (id, value) VALUES (-1, '%s')", tableName, testValue)
+	
+	// Send request to insert test record
+	queryReq := QueryRequest{Query: insertSQL}
+	reqBody, err := json.Marshal(queryReq)
+	if err != nil {
+		return fmt.Errorf("failed to marshal test insert request: %w", err)
+	}
+	
+	req, err := http.NewRequest(http.MethodPut, serverURL+"/query", bytes.NewBuffer(reqBody))
+	if err != nil {
+		return fmt.Errorf("failed to create test insert HTTP request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	
+	client := &http.Client{}
+	httpResp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to send test insert request: %w", err)
+	}
+	defer httpResp.Body.Close()
+	
+	if httpResp.StatusCode != http.StatusOK {
+		return fmt.Errorf("server returned non-OK status for test insert: %s", httpResp.Status)
+	}
+	
+	// Now wait a moment for the insert to be processed
+	time.Sleep(2 * time.Second)
+	
+	// Try to query the test record back
+	querySQL := fmt.Sprintf("SELECT id, value FROM %s WHERE id = -1", tableName)
+	url := fmt.Sprintf("%s/query?query=%s", serverURL, url.QueryEscape(querySQL))
+	
+	// Send GET request
+	resp, err := http.Get(url)
+	if err != nil {
+		return fmt.Errorf("failed to query test record: %w", err)
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("server returned non-OK status for test query: %s", resp.Status)
+	}
+	
+	// Parse the response
+	var queryResp QueryResponse
+	if err := json.NewDecoder(resp.Body).Decode(&queryResp); err != nil {
+		return fmt.Errorf("failed to decode test query response: %w", err)
+	}
+	
+	if !queryResp.Success {
+		return fmt.Errorf("test query failed: %s", queryResp.Error)
+	}
+	
+	// Check if the test record is found
+	if len(queryResp.Results) <= 1 { // Just header row
+		return fmt.Errorf("test record not found in table %s", tableName)
+	}
+	
+	// Validate the returned value matches what we inserted
+	if len(queryResp.Results) > 1 && len(queryResp.Results[1]) > 1 {
+		valueObj := queryResp.Results[1][1]
+		if value, ok := valueObj.(string); ok {
+			if value == testValue {
+				// Test successful - clean up by deleting the test record
+				deleteSQL := fmt.Sprintf("DELETE FROM %s WHERE id = -1", tableName)
+				deleteReq := QueryRequest{Query: deleteSQL}
+				reqBody, _ := json.Marshal(deleteReq)
+				http.Post(serverURL+"/query", "application/json", bytes.NewBuffer(reqBody))
+				
+				return nil // Test passed
+			}
+			return fmt.Errorf("test value mismatch: expected '%s', got '%s'", testValue, value)
+		}
+	}
+	
+	return fmt.Errorf("invalid test query result format")
 }
 
 // Get server status
